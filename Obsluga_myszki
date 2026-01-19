@@ -1,0 +1,202 @@
+#include "MKL05Z4.h"
+#include <stdio.h>
+
+/* ===== PS/2 PINY ===== */
+#define PS2_CLK_PORT   PTB
+#define PS2_CLK_PIN    3
+#define PS2_DATA_PORT  PTB
+#define PS2_DATA_PIN   4
+
+/* ===== UART ===== */
+void UART0_Init(void)
+{
+    SIM->SCGC4 |= SIM_SCGC4_UART0_MASK;
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
+
+    SIM->SOPT2 = (SIM->SOPT2 & ~SIM_SOPT2_UART0SRC_MASK)
+               | SIM_SOPT2_UART0SRC(1);
+
+    PORTB->PCR[1] = PORT_PCR_MUX(2); // TX
+    PORTB->PCR[2] = PORT_PCR_MUX(2); // RX
+
+    UART0->C2 &= ~(UART0_C2_TE_MASK | UART0_C2_RE_MASK);
+
+    UART0->BDH = UART0_BDH_SBR(1);
+    UART0->BDL = 17;
+    UART0->C4  = UART0_C4_OSR(15);
+
+    UART0->C2 |= UART0_C2_TE_MASK;
+}
+
+void UART_SendString(char *s)
+{
+    while (*s)
+    {
+        while (!(UART0->S1 & UART0_S1_TDRE_MASK));
+        UART0->D = *s++;
+    }
+}
+
+/* ===== Delay ===== */
+void delay_us(uint32_t us)
+{
+    volatile uint32_t i;
+    while (us--)
+        for (i = 0; i < 16; i++) __NOP();
+}
+
+/* ===== ELEGANCKIE LOW / HIGH-Z ===== */
+void PS2_CLK_LOW(void)
+{
+    PS2_CLK_PORT->PCOR = (1 << PS2_CLK_PIN);
+    PS2_CLK_PORT->PDDR |= (1 << PS2_CLK_PIN);
+}
+
+void PS2_CLK_HIGH(void)
+{
+    PS2_CLK_PORT->PDDR &= ~(1 << PS2_CLK_PIN);
+}
+
+void PS2_DATA_LOW(void)
+{
+    PS2_DATA_PORT->PCOR = (1 << PS2_DATA_PIN);
+    PS2_DATA_PORT->PDDR |= (1 << PS2_DATA_PIN);
+}
+
+void PS2_DATA_HIGH(void)
+{
+    PS2_DATA_PORT->PDDR &= ~(1 << PS2_DATA_PIN);
+}
+
+/* ===== PS/2 INIT ===== */
+void PS2_Init(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTB_MASK;
+
+    PORTB->PCR[PS2_CLK_PIN] =
+        PORT_PCR_MUX(1) |
+        PORT_PCR_PE_MASK |
+        PORT_PCR_PS_MASK;
+
+    PORTB->PCR[PS2_DATA_PIN] =
+        PORT_PCR_MUX(1) |
+        PORT_PCR_PE_MASK |
+        PORT_PCR_PS_MASK;
+
+    PS2_CLK_HIGH();
+    PS2_DATA_HIGH();
+}
+
+/* ===== Czekaj na opadające CLK ===== */
+void waitForClockLow(void)
+{
+    while (PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN));
+}
+
+/* ===== Wyślij 1 bit ===== */
+void PS2_writeBit(uint8_t bit)
+{
+    if (bit) PS2_DATA_HIGH();
+    else     PS2_DATA_LOW();
+
+    waitForClockLow();
+    while (!(PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN)));
+}
+
+/* ===== Wyślij bajt ===== */
+void PS2_writeByte(uint8_t data)
+{
+    uint8_t parity = 1;
+
+    // 1. Inhibit – zatrzymaj mysz
+		PS2_DATA_LOW();
+    // 3. Czekaj na PIERWSZE opadające zbocze CLK
+    while (PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN));
+
+    // 4. START BIT dokładnie na 1. takcie
+    PS2_DATA_LOW();
+
+    // 5. Czekaj na rosnące zbocze (koniec bitu startu)
+    while (!(PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN)));
+
+    // 6. 8 bitów danych, LSB first
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        uint8_t bit = (data >> i) & 1;
+        if (bit) PS2_DATA_HIGH();
+        else     PS2_DATA_LOW();
+
+        // czekaj na falling edge (próbkowanie)
+        while (PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN));
+        while (!(PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN)));
+
+        parity ^= bit;
+    }
+
+    // 7. Bit parzystości
+    PS2_DATA_HIGH();
+    //else        PS2_DATA_LOW();
+
+    while (PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN));
+    while (!(PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN)));
+
+    // 8. Stop bit
+    PS2_DATA_HIGH();
+
+    while (PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN));
+    while (!(PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN)));
+}
+
+
+/* ===== Odbiór bajtu ===== */
+uint8_t PS2_readByte(void)
+{
+    uint8_t data = 0;
+
+    // START
+    while (PS2_DATA_PORT->PDIR & (1 << PS2_DATA_PIN));
+
+    for (uint8_t i = 0; i < 8; i++)
+    {
+        while (PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN));
+        if (PS2_DATA_PORT->PDIR & (1 << PS2_DATA_PIN))
+            data |= (1 << i);
+        while (!(PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN)));
+    }
+
+    // parity + stop
+    for (int i = 0; i < 2; i++)
+    {
+        while (PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN));
+        while (!(PS2_CLK_PORT->PDIR & (1 << PS2_CLK_PIN)));
+    }
+
+    return data;
+}
+
+/* ===== MAIN ===== */
+int main(void)
+{
+    char buf[32];
+    uint8_t ack, bat, asd;
+
+    UART0_Init();
+    PS2_Init();
+
+    delay_us(2000);
+
+    // RESET MYSZY
+    PS2_writeByte(0xFF);
+
+    ack = PS2_readByte(); // FA
+    bat = PS2_readByte(); // AA
+		asd = PS2_readByte(); 
+
+    sprintf(buf, "PS2: %02X %02X %02X\r\n", ack, bat, asd);
+    UART_SendString(buf);
+
+    while (1)
+    {
+        // gotowe do dalszej obsługi
+    }
+}
